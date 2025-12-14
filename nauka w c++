@@ -1,0 +1,331 @@
+#include <iostream>
+#include <string>
+#include <random>
+#include <cmath>
+#include <vector>
+#include <openssl/hmac.h>
+#include <openssl/sha.h>
+
+class CaptchaEngine {
+private:
+    std::string secret_key;
+    std::mt19937 rng;
+    
+    // Korpus znaków (wykluczamy podobne: 0/O, 1/l/I)
+    const std::string CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    
+public:
+    struct Challenge {
+        std::string id;
+        std::string plaintext;
+        std::string token;
+        long timestamp;
+        std::vector<std::vector<int>> distorted_image;
+    };
+    
+    CaptchaEngine(const std::string& key) 
+        : secret_key(key), rng(std::random_device{}()) {}
+    
+    // Generacja losowego tekstu
+    std::string generateText(int length = 6) {
+        std::uniform_int_distribution<> dist(0, CHARSET.size() - 1);
+        std::string text;
+        for (int i = 0; i < length; ++i) {
+            text += CHARSET[dist(rng)];
+        }
+        return text;
+    }
+    
+    // Nieliniowa deformacja siatki (grid warping)
+    std::vector<std::vector<int>> applyGridWarping(
+        const std::string& text, 
+        int width = 200, 
+        int height = 60
+    ) {
+        std::vector<std::vector<int>> image(height, std::vector<int>(width, 255));
+        
+        // Parametry deformacji
+        std::uniform_real_distribution<> alpha_dist(-5.0, 5.0);
+        std::uniform_real_distribution<> beta_dist(-5.0, 5.0);
+        double alpha = alpha_dist(rng);
+        double beta = beta_dist(rng);
+        double lambda = 20.0; // długość fali
+        
+        // Rysowanie każdego znaku
+        int char_spacing = width / (text.length() + 1);
+        for (size_t i = 0; i < text.length(); ++i) {
+            int base_x = char_spacing * (i + 1);
+            int base_y = height / 2;
+            
+            // Rotacja znaku
+            std::uniform_real_distribution<> theta_dist(-0.5, 0.5); // radiany
+            double theta = theta_dist(rng);
+            
+            // Uproszczone rysowanie (bitmap font)
+            drawCharacter(image, text[i], base_x, base_y, theta);
+        }
+        
+        // Aplikacja deformacji nieliniowej
+        std::vector<std::vector<int>> warped(height, std::vector<int>(width, 255));
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                // Transformacja odwrotna (backward mapping)
+                double x_src = x + alpha * std::sin(2.0 * M_PI * y / lambda);
+                double y_src = y + beta * std::cos(2.0 * M_PI * x / lambda);
+                
+                // Bilinear interpolation
+                int x0 = static_cast<int>(x_src);
+                int y0 = static_cast<int>(y_src);
+                
+                if (x0 >= 0 && x0 < width - 1 && y0 >= 0 && y0 < height - 1) {
+                    double wx = x_src - x0;
+                    double wy = y_src - y0;
+                    
+                    warped[y][x] = static_cast<int>(
+                        (1 - wx) * (1 - wy) * image[y0][x0] +
+                        wx * (1 - wy) * image[y0][x0 + 1] +
+                        (1 - wx) * wy * image[y0 + 1][x0] +
+                        wx * wy * image[y0 + 1][x0 + 1]
+                    );
+                }
+            }
+        }
+        
+        // Dodaj szum Gaussowski
+        addGaussianNoise(warped, 15.0);
+        
+        // Dodaj linie zakłócające (Bezier curves)
+        addOcclusionLines(warped, 5);
+        
+        return warped;
+    }
+    
+    // Szum Gaussowski: N(μ=0, σ²)
+    void addGaussianNoise(std::vector<std::vector<int>>& image, double sigma) {
+        std::normal_distribution<> noise_dist(0.0, sigma);
+        for (auto& row : image) {
+            for (auto& pixel : row) {
+                int noisy = pixel + static_cast<int>(noise_dist(rng));
+                pixel = std::clamp(noisy, 0, 255);
+            }
+        }
+    }
+    
+    // Linie zakłócające (kubiczne krzywe Béziera)
+    void addOcclusionLines(std::vector<std::vector<int>>& image, int num_lines) {
+        int height = image.size();
+        int width = image[0].size();
+        std::uniform_int_distribution<> x_dist(0, width - 1);
+        std::uniform_int_distribution<> y_dist(0, height - 1);
+        
+        for (int i = 0; i < num_lines; ++i) {
+            // Punkty kontrolne krzywej Béziera
+            std::vector<std::pair<int, int>> control_points = {
+                {x_dist(rng), y_dist(rng)},
+                {x_dist(rng), y_dist(rng)},
+                {x_dist(rng), y_dist(rng)},
+                {x_dist(rng), y_dist(rng)}
+            };
+            
+            // Parametryzacja krzywej: B(t), t ∈ [0,1]
+            for (double t = 0.0; t <= 1.0; t += 0.01) {
+                auto [x, y] = bezierCubic(control_points, t);
+                if (x >= 0 && x < width && y >= 0 && y < height) {
+                    image[y][x] = 0; // czarna linia
+                }
+            }
+        }
+    }
+    
+    // Kubiczna krzywa Béziera: B(t) = (1-t)³P₀ + 3(1-t)²tP₁ + 3(1-t)t²P₂ + t³P₃
+    std::pair<int, int> bezierCubic(
+        const std::vector<std::pair<int, int>>& P, 
+        double t
+    ) {
+        double u = 1.0 - t;
+        double tt = t * t;
+        double uu = u * u;
+        double uuu = uu * u;
+        double ttt = tt * t;
+        
+        int x = static_cast<int>(
+            uuu * P[0].first + 
+            3 * uu * t * P[1].first + 
+            3 * u * tt * P[2].first + 
+            ttt * P[3].first
+        );
+        
+        int y = static_cast<int>(
+            uuu * P[0].second + 
+            3 * uu * t * P[1].second + 
+            3 * u * tt * P[2].second + 
+            ttt * P[3].second
+        );
+        
+        return {x, y};
+    }
+    
+    // Uproszczone rysowanie znaku (w praktyce: bitmap fonts)
+    void drawCharacter(
+        std::vector<std::vector<int>>& image, 
+        char c, 
+        int x, 
+        int y, 
+        double theta
+    ) {
+        // Symulacja: narysuj prostokąt reprezentujący znak
+        int char_width = 15;
+        int char_height = 30;
+        
+        for (int dy = -char_height/2; dy < char_height/2; ++dy) {
+            for (int dx = -char_width/2; dx < char_width/2; ++dx) {
+                // Rotacja punktu
+                int rx = static_cast<int>(
+                    x + dx * std::cos(theta) - dy * std::sin(theta)
+                );
+                int ry = static_cast<int>(
+                    y + dx * std::sin(theta) + dy * std::cos(theta)
+                );
+                
+                if (ry >= 0 && ry < image.size() && 
+                    rx >= 0 && rx < image[0].size()) {
+                    image[ry][rx] = 0; // czarny piksel
+                }
+            }
+        }
+    }
+    
+    // HMAC-SHA256 do zabezpieczenia tokenu
+    std::string computeHMAC(const std::string& data) {
+        unsigned char* digest = HMAC(
+            EVP_sha256(),
+            secret_key.c_str(), secret_key.length(),
+            reinterpret_cast<const unsigned char*>(data.c_str()), data.length(),
+            nullptr, nullptr
+        );
+        
+        // Konwersja do hex
+        char hex[65];
+        for (int i = 0; i < 32; ++i) {
+            sprintf(hex + i * 2, "%02x", digest[i]);
+        }
+        return std::string(hex, 64);
+    }
+    
+    // Generacja pełnego wyzwania
+    Challenge generateChallenge() {
+        Challenge ch;
+        ch.id = generateUUID();
+        ch.plaintext = generateText(6);
+        ch.timestamp = std::time(nullptr);
+        
+        // Kryptograficzny token
+        std::string token_data = ch.id + "|" + 
+                                std::to_string(ch.timestamp) + "|" + 
+                                ch.plaintext;
+        ch.token = computeHMAC(token_data);
+        
+        // Zniekształcony obraz
+        ch.distorted_image = applyGridWarping(ch.plaintext);
+        
+        return ch;
+    }
+    
+    // Weryfikacja odpowiedzi
+    bool verifyResponse(
+        const Challenge& ch, 
+        const std::string& user_response,
+        long current_time
+    ) {
+        // 1. Sprawdź timeout (60 sekund)
+        if (current_time - ch.timestamp > 60) {
+            return false;
+        }
+        
+        // 2. Weryfikuj HMAC
+        std::string expected_token_data = ch.id + "|" + 
+                                         std::to_string(ch.timestamp) + "|" + 
+                                         ch.plaintext;
+        std::string expected_token = computeHMAC(expected_token_data);
+        if (ch.token != expected_token) {
+            return false; // token został zmodyfikowany
+        }
+        
+        // 3. Porównaj odpowiedź (case-insensitive)
+        std::string normalized_response = user_response;
+        std::transform(
+            normalized_response.begin(), 
+            normalized_response.end(), 
+            normalized_response.begin(), 
+            ::toupper
+        );
+        
+        // 4. Pozwól na małą odległość edycyjną (1 błąd)
+        int edit_distance = levenshteinDistance(ch.plaintext, normalized_response);
+        return edit_distance <= 1;
+    }
+    
+    // Odległość Levenshteina (programowanie dynamiczne)
+    int levenshteinDistance(const std::string& s1, const std::string& s2) {
+        int m = s1.length();
+        int n = s2.length();
+        std::vector<std::vector<int>> dp(m + 1, std::vector<int>(n + 1));
+        
+        for (int i = 0; i <= m; ++i) dp[i][0] = i;
+        for (int j = 0; j <= n; ++j) dp[0][j] = j;
+        
+        for (int i = 1; i <= m; ++i) {
+            for (int j = 1; j <= n; ++j) {
+                int cost = (s1[i-1] == s2[j-1]) ? 0 : 1;
+                dp[i][j] = std::min({
+                    dp[i-1][j] + 1,      // deletion
+                    dp[i][j-1] + 1,      // insertion
+                    dp[i-1][j-1] + cost  // substitution
+                });
+            }
+        }
+        
+        return dp[m][n];
+    }
+    
+    std::string generateUUID() {
+        std::uniform_int_distribution<> dist(0, 15);
+        const char* hex = "0123456789abcdef";
+        std::string uuid = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx";
+        for (char& c : uuid) {
+            if (c == 'x') c = hex[dist(rng)];
+            else if (c == 'y') c = hex[(dist(rng) & 0x3) | 0x8];
+        }
+        return uuid;
+    }
+};
+
+// PRZYKŁAD UŻYCIA
+int main() {
+    CaptchaEngine engine("super_secret_key_2025");
+    
+    // Generuj wyzwanie
+    auto challenge = engine.generateChallenge();
+    
+    std::cout << "=== CAPTCHA CHALLENGE ===" << std::endl;
+    std::cout << "Challenge ID: " << challenge.id << std::endl;
+    std::cout << "Token: " << challenge.token << std::endl;
+    std::cout << "Plaintext (SECRET): " << challenge.plaintext << std::endl;
+    std::cout << "\nDistorted image dimensions: " 
+              << challenge.distorted_image.size() << "x" 
+              << challenge.distorted_image[0].size() << std::endl;
+    
+    // Symuluj odpowiedź użytkownika
+    std::string user_input;
+    std::cout << "\nEnter CAPTCHA text: ";
+    std::cin >> user_input;
+    
+    // Weryfikacja
+    long current_time = std::time(nullptr);
+    bool valid = engine.verifyResponse(challenge, user_input, current_time);
+    
+    std::cout << "\n=== VERIFICATION ===" << std::endl;
+    std::cout << "Result: " << (valid ? "✓ PASS" : "✗ FAIL") << std::endl;
+    
+    return 0;
+}
